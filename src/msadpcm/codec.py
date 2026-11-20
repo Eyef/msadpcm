@@ -203,10 +203,11 @@ QUALITY_LEVELS = {
 }
 
 _REFINE_MULTS = (0.8, 0.9, 1.1, 1.25)
-#: Rough number of candidate lanes processed per vectorised chunk.  Small enough
-#: for a smooth progress callback and cache-friendly, large enough that numpy
-#: call overhead does not matter.
-_LANES_PER_CHUNK = 1 << 14
+#: Rough number of candidate lanes processed per vectorised chunk.  Larger chunks
+#: amortise the per-chunk Python overhead; timings between 1 << 14 and 1 << 17 differ
+#: by less than run-to-run noise on the machines tested, so this is the value the
+#: 0.1.0 release was measured with.  Progress reporting does not depend on it.
+_LANES_PER_CHUNK = 1 << 17
 #: Upper bound for ``rows * samples_per_block`` per chunk; keeps memory flat
 #: (roughly 120 MB) however large the blocks are.
 _ELEMS_PER_CHUNK = 1 << 22
@@ -227,6 +228,7 @@ def _simulate(
     c1_tab: np.ndarray,
     c2_tab: np.ndarray,
     want_nibs: bool = False,
+    tick: Optional[Callable[[float], None]] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Encode every row of ``x`` with every candidate.
 
@@ -235,6 +237,7 @@ def _simulate(
     cand_delta : (r, M) initial delta per candidate
     want_nibs  : also return the nibbles; only worth it for a few candidates,
                  the buffer is (N-2) * r * M bytes
+    tick       : optional ``callback(fraction_done)`` called every 32 samples
     returns    : err (r, M) float64 squared error, nibbles (N-2, r*M) uint8 or None
     """
     r, n = x.shape
@@ -254,6 +257,8 @@ def _simulate(
     nibs = np.empty((n - 2, lanes), dtype=np.uint8) if want_nibs else None
 
     for i in range(2, n):
+        if tick is not None and not (i & 31):
+            tick((i - 2) / (n - 2))
         pred = _trunc_div256(s1 * c1 + s2 * c2)
         target = xt[i][row]
         q = np.rint((target - pred) / delta)
@@ -286,8 +291,13 @@ def _search_rows(
     n_pred: int,
     mults: Sequence[float],
     refine: bool,
+    tick: Optional[Callable[[float], None]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Find predictor, initial delta and nibbles for each row of ``x``."""
+    """Find predictor, initial delta and nibbles for each row of ``x``.
+
+    ``tick(fraction)`` reports progress over the three simulation passes,
+    weighted by how many candidate lanes each one processes.
+    """
     r, n = x.shape
     n_coef = len(c1_tab)
     n_pred = min(n_pred, n_coef)
@@ -320,7 +330,15 @@ def _search_rows(
     cand_delta = cand_delta.reshape(r, -1)
     cand_pred = np.ascontiguousarray(cand_pred.reshape(r, -1))
 
-    err, _ = _simulate(x, cand_pred, cand_delta, c1_tab, c2_tab)
+    w_main, w_ref = cand_pred.shape[1], (len(_REFINE_MULTS) if refine else 0)
+    w_all = float(w_main + w_ref + 1)
+
+    def stage(lo_w: float, hi_w: float):
+        if tick is None:
+            return None
+        return lambda f: tick((lo_w + f * (hi_w - lo_w)) / w_all)
+
+    err, _ = _simulate(x, cand_pred, cand_delta, c1_tab, c2_tab, tick=stage(0, w_main))
     ar = np.arange(r)
     best = err.argmin(axis=1)
     best_pred = cand_pred[ar, best]
@@ -332,7 +350,7 @@ def _search_rows(
         rdelta = np.rint(best_delta[:, None] * rm[None, :])
         rdelta = np.clip(rdelta, MIN_DELTA, MAX_HEADER_DELTA).astype(np.int32)
         rpred = np.broadcast_to(best_pred[:, None], rdelta.shape).copy()
-        err2, _ = _simulate(x, rpred, rdelta, c1_tab, c2_tab)
+        err2, _ = _simulate(x, rpred, rdelta, c1_tab, c2_tab, tick=stage(w_main, w_main + w_ref))
         b2 = err2.argmin(axis=1)
         e2 = err2[ar, b2]
         better = e2 < best_err
@@ -341,7 +359,8 @@ def _search_rows(
 
     # Only the winners need their nibbles: one extra pass over r lanes.
     final_err, best_nibs = _simulate(
-        x, best_pred[:, None], best_delta[:, None].astype(np.int32), c1_tab, c2_tab, want_nibs=True)
+        x, best_pred[:, None], best_delta[:, None].astype(np.int32), c1_tab, c2_tab,
+        want_nibs=True, tick=stage(w_main + w_ref, w_all))
     best_err = final_err[:, 0]
     best_nibs = best_nibs.T  # (r, N-2)
 
@@ -374,18 +393,23 @@ def _encode_rows(
     deltas = np.empty(total, dtype=np.int32)
     nibs = np.empty((total, n - 2), dtype=np.uint8)
     errs = np.empty(total, dtype=np.float64)
-    done = 0
-    if progress:
-        progress(0, total)
+    last = -1
+
+    def report(done: int) -> None:
+        nonlocal last
+        if progress and done > last:
+            last = done
+            progress(done, total)
+
+    report(0)
     for lo in range(0, total, step):
         hi = min(total, lo + step)
+        tick = (lambda f, lo=lo, hi=hi: report(lo + int(f * (hi - lo)))) if progress else None
         p, d, nb, e = _search_rows(
-            x[lo:hi], c1_tab, c2_tab, cfg["n_pred"], cfg["mults"], cfg["refine"]
+            x[lo:hi], c1_tab, c2_tab, cfg["n_pred"], cfg["mults"], cfg["refine"], tick
         )
         preds[lo:hi], deltas[lo:hi], nibs[lo:hi], errs[lo:hi] = p, d, nb, e
-        done = hi
-        if progress:
-            progress(done, total)
+        report(hi)
     return preds, deltas, nibs, errs
 
 
