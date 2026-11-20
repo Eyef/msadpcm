@@ -21,7 +21,7 @@ import msadpcm  # noqa: E402
 from helpers import SIGNALS  # noqa: E402
 
 RATE, SECONDS = 22050, 6
-PRESETS = ("fast", "high", "max")
+PRESETS = ("fast", "normal", "high", "max")
 
 
 def ffmpeg_encode(pcm, block_align, tmp):
