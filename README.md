@@ -26,7 +26,7 @@ msadpcm.write_wav("out.wav", pcm, 22050)                 # pcm: int16 (frames,) 
 pcm, rate = msadpcm.read_wav("out.wav")                  # ADPCM or PCM in, int16 (frames, channels) out
 
 # raw blocks
-blocks = msadpcm.encode(pcm, block_align=512, quality="high")
+blocks = msadpcm.encode(pcm, block_align=512)            # quality="normal" by default
 pcm = msadpcm.decode(blocks, channels=1, block_align=512, n_samples=len(pcm))
 ```
 
@@ -49,18 +49,21 @@ Without an explicit size `write_wav` uses what Windows' ACM codec does
 
 ### Quality presets
 
-`quality="fast" | "normal" | "high" (default) | "max"`: how many candidate step sizes are tried per
-block. All presets try all seven predictors.
+`quality="fast" | "normal" (default) | "high" | "max"`: how many candidate step sizes are tried per
+block. All presets try all seven predictors. `normal` is within a few hundredths of a dB of `high` at
+about half the encoding time; use `high` or `max` when you want the last bit of quality and don't mind
+waiting, `fast` for quick previews or batch jobs.
 
 ### Command line
 
 ```
-python -m msadpcm encode in.wav -o out.wav --samples-per-block 128 --quality high
+python -m msadpcm encode in.wav -o out.wav --samples-per-block 128 --quality normal
 python -m msadpcm decode out.wav -o back.wav
 python -m msadpcm info *.wav
 ```
 
-`encode` prints the SNR of the result (it decodes the file again) unless `--no-verify` is given.
+`encode` shows a progress line on a terminal (nothing is printed when the output is redirected) and
+reports the SNR of the result (it decodes the file again) unless `--no-verify` is given.
 
 ## Quality and speed
 
@@ -68,21 +71,23 @@ SNR in dB (higher is better), 6 s of mono audio at 22.05 kHz, run with
 `python benchmarks/compare_ffmpeg.py` (ffmpeg 6.1). All files were decoded with msadpcm's decoder,
 which is bit-exact with FFmpeg's, so the differences come from the encoders only.
 
-| signal | block | ffmpeg `adpcm_ms` | fast | high | max |
-|---|---|---|---|---|---|
-| voice-like | 256 | 30.40 | 39.20 | 39.88 | 40.04 |
-| music-like | 256 | 34.54 | 42.14 | 42.59 | 42.76 |
-| white noise | 256 | 14.12 | 16.59 | 16.72 | 16.77 |
-| voice-like | 1024 | 30.87 | 38.60 | 38.86 | 38.97 |
-| music-like | 1024 | 34.54 | 39.19 | 39.38 | 39.46 |
-| white noise | 1024 | 14.13 | 16.52 | 16.57 | 16.59 |
+| signal | block | ffmpeg `adpcm_ms` | fast | normal | high | max |
+|---|---|---|---|---|---|---|
+| voice-like | 256 | 30.40 | 39.20 | 39.76 | 39.88 | 40.04 |
+| music-like | 256 | 34.54 | 42.14 | 42.53 | 42.59 | 42.76 |
+| white noise | 256 | 14.12 | 16.59 | 16.71 | 16.72 | 16.77 |
+| voice-like | 1024 | 30.87 | 38.60 | 38.84 | 38.86 | 38.97 |
+| music-like | 1024 | 34.54 | 39.19 | 39.32 | 39.38 | 39.46 |
+| white noise | 1024 | 14.13 | 16.52 | 16.56 | 16.57 | 16.59 |
 
 Caveats: the signals are synthetic (the test suite needs no audio assets), and harmonic signals
 reward good predictor choice more than typical recordings do, so expect smaller gains on real
 material. Run the script on your own files before relying on these numbers.
 
-Encoding time is roughly 0.1x to 0.4x of real time at `high` on one core (about 10-20x faster than
-real time for typical block sizes). Memory is bounded regardless of block size.
+Speed depends on the CPU (NumPy uses SIMD instructions where available). Measured on a 2012 Core
+i7-3770, 184 s of mono 48 kHz music with 1024-byte blocks: `fast` 7.1 s (26x real time, SNR 34.08 dB),
+`normal` 15.8 s (12x, 34.26 dB), `high` 32.7 s (5.6x, 34.30 dB). Newer processors are several times
+faster. Stereo takes twice as long as mono. Memory use stays bounded regardless of block size.
 
 ## Format notes
 
@@ -115,16 +120,16 @@ raw = msadpcm.encode(pcm, samples_per_block=128)                         # block
 
 | | |
 |---|---|
-| `encode(pcm, *, channels=None, block_align=None, samples_per_block=None, quality="high", coeffs=None, progress=None) -> bytes` | raw blocks |
+| `encode(pcm, *, channels=None, block_align=None, samples_per_block=None, quality="normal", coeffs=None, progress=None) -> bytes` | raw blocks |
 | `decode(data, *, channels, block_align, n_samples=None, coeffs=None) -> int16[frames, channels]` | raw blocks |
-| `write_wav(path, pcm, rate, *, adpcm=True, block_align=None, samples_per_block=None, quality="high", coeffs=None, progress=None)` | `adpcm=False` writes 16-bit PCM |
+| `write_wav(path, pcm, rate, *, adpcm=True, block_align=None, samples_per_block=None, quality="normal", coeffs=None, progress=None)` | `adpcm=False` writes 16-bit PCM |
 | `read_wav(path) -> (int16[frames, channels], rate)` | PCM 8/16/24/32, float, extensible, MS ADPCM |
 | `wav_info(path) -> WavInfo`, `read_adpcm_raw(path)` | header / undecoded blocks |
 | `format_chunk(rate, channels, block_align, coeffs=None)` | `fmt ` chunk body |
 | `samples_per_block`, `block_align_for`, `default_block_align`, `snr_db` | helpers |
 
 `progress` is `callback(done_blocks, total_blocks)`; encoding is vectorised over all blocks, so the
-callback fires per processed chunk of blocks, not per block.
+callback fires once per processed chunk of blocks (a few hundred blocks), not per block.
 
 ## Development
 
