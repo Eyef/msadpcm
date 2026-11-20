@@ -42,7 +42,7 @@ def convert_file(
     mode: str = "encode",
     block_align: Optional[int] = None,
     samples_per_block: Optional[int] = None,
-    quality: str = "high",
+    quality: str = "normal",
     verify: bool = True,
     progress: Optional[Callable[[int, int], None]] = None,
 ) -> ConversionResult:
@@ -77,6 +77,48 @@ def convert_file(
         snr = codec.snr_db(pcm, decoded)
     return ConversionResult(src, dst, mode, frames, rate, ch, src.stat().st_size, written,
                             time.perf_counter() - t0, ba, spb, snr)
+
+
+class _ProgressLine:
+    """Single updating status line on stderr (``name: encoding 45%``).
+
+    Shown only on an interactive terminal, so redirected output and logs stay
+    clean.  Call the instance as the ``progress`` callback; call :meth:`clear`
+    before printing anything else.
+    """
+
+    def __init__(self, label: str, stream=None) -> None:
+        self.label = label
+        self.stream = sys.stderr if stream is None else stream
+        self.enabled = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._shown = 0
+        self._last = -1
+        self._t0 = time.perf_counter()
+
+    def __call__(self, done: int, total: int) -> None:
+        if not self.enabled or total <= 0:
+            return
+        percent = 100 * done // total
+        if percent == self._last:
+            return
+        self._last = percent
+        elapsed = time.perf_counter() - self._t0
+        text = "%s: encoding %d%%" % (self.label, percent)
+        if 0 < done < total and elapsed >= 2.0:
+            text += "  (%ds left)" % round(elapsed * (total - done) / done)
+        self._write(text)
+
+    def _write(self, text: str) -> None:
+        pad = " " * max(0, self._shown - len(text))
+        self.stream.write("\r" + text + pad)
+        self.stream.flush()
+        self._shown = len(text)
+
+    def clear(self) -> None:
+        if self.enabled and self._shown:
+            self.stream.write("\r" + " " * self._shown + "\r")
+            self.stream.flush()
+            self._shown = 0
 
 
 def _describe(r: ConversionResult) -> str:
@@ -116,7 +158,7 @@ def _build_parser() -> argparse.ArgumentParser:
     g = enc.add_mutually_exclusive_group()
     g.add_argument("--block-align", type=int, help="bytes per block (default: like Windows ACM)")
     g.add_argument("--samples-per-block", type=int, help="sample frames per block, e.g. 128")
-    enc.add_argument("--quality", choices=list(codec.QUALITY_LEVELS), default="high")
+    enc.add_argument("--quality", choices=list(codec.QUALITY_LEVELS), default="normal")
     enc.add_argument("-o", "--output")
     enc.add_argument("-d", "--outdir")
     enc.add_argument("--no-verify", action="store_true", help="skip the SNR check")
@@ -155,11 +197,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.outdir:
                 Path(args.outdir).mkdir(parents=True, exist_ok=True)
             kwargs = {}
+            line = None
             if args.cmd == "encode":
+                line = _ProgressLine(src.name)
                 kwargs = dict(block_align=args.block_align,
                               samples_per_block=args.samples_per_block,
-                              quality=args.quality, verify=not args.no_verify)
-            print(_describe(convert_file(src, dst, mode=args.cmd, **kwargs)))
+                              quality=args.quality, verify=not args.no_verify,
+                              progress=line)
+            try:
+                result = convert_file(src, dst, mode=args.cmd, **kwargs)
+            finally:
+                if line is not None:
+                    line.clear()
+            print(_describe(result))
         except Exception as exc:  # report and continue with the next file
             failures += 1
             print("%s: error: %s" % (src, exc), file=sys.stderr)

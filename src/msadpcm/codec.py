@@ -203,8 +203,10 @@ QUALITY_LEVELS = {
 }
 
 _REFINE_MULTS = (0.8, 0.9, 1.1, 1.25)
-#: Rough number of candidate lanes processed per vectorised chunk.
-_LANES_PER_CHUNK = 1 << 17
+#: Rough number of candidate lanes processed per vectorised chunk.  Small enough
+#: for a smooth progress callback and cache-friendly, large enough that numpy
+#: call overhead does not matter.
+_LANES_PER_CHUNK = 1 << 14
 #: Upper bound for ``rows * samples_per_block`` per chunk; keeps memory flat
 #: (roughly 120 MB) however large the blocks are.
 _ELEMS_PER_CHUNK = 1 << 22
@@ -427,7 +429,7 @@ def encode(
     channels: Optional[int] = None,
     block_align: Optional[int] = None,
     samples_per_block: Optional[int] = None,  # noqa: F811 - public keyword name
-    quality: str = "high",
+    quality: str = "normal",
     coeffs: Optional[Coeffs] = None,
     progress: Optional[ProgressFn] = None,
 ) -> bytes:
@@ -445,7 +447,8 @@ def encode(
         Size of one block in bytes, or, alternatively, in sample frames.
         Defaults to ``256 * channels`` bytes.
     quality
-        ``"fast"``, ``"normal"`` or ``"high"`` (see :data:`QUALITY_LEVELS`).
+        ``"fast"``, ``"normal"`` (default), ``"high"`` or ``"max"``; slower presets
+        try more candidates and gain a fraction of a dB (see :data:`QUALITY_LEVELS`).
     coeffs
         Custom predictor table; default is the seven standard pairs.
     progress

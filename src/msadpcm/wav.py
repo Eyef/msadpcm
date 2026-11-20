@@ -216,7 +216,7 @@ def write_wav(
     channels: Optional[int] = None,
     block_align: Optional[int] = None,
     samples_per_block: Optional[int] = None,
-    quality: str = "high",
+    quality: str = "normal",
     coeffs: Optional[codec.Coeffs] = None,
     progress: Optional[Callable[[int, int], None]] = None,
 ) -> int:
