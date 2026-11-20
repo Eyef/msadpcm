@@ -66,3 +66,82 @@ def test_gui_demo_block_choices():
     for label in mod.BLOCK_CHOICES:                  # every choice is accepted by the encoder
         ba, spb = mod.parse_block_choice(label)
         msadpcm.encode(helpers.voice(300), block_align=ba, samples_per_block=spb, quality="fast")
+
+
+# --------------------------------------------------------------------------
+# progress line and defaults
+# --------------------------------------------------------------------------
+class FakeStream:
+    def __init__(self, tty):
+        self.tty, self.chunks = tty, []
+
+    def isatty(self):
+        return self.tty
+
+    def write(self, text):
+        self.chunks.append(text)
+
+    def flush(self):
+        pass
+
+    @property
+    def text(self):
+        return "".join(self.chunks)
+
+
+def test_progress_line_on_terminal():
+    s = FakeStream(tty=True)
+    line = cli._ProgressLine("a.wav", s)
+    for done in range(0, 101, 5):
+        line(done, 100)
+    line(100, 100)                      # repeated percentage is not redrawn twice
+    assert "a.wav: encoding 0%" in s.text and "a.wav: encoding 100%" in s.text
+    assert s.text.count("encoding 50%") == 1
+    line.clear()
+    assert s.text.endswith("\r") and s.text.count("\r") > 20
+
+
+def test_progress_line_silent_when_redirected():
+    s = FakeStream(tty=False)
+    line = cli._ProgressLine("a.wav", s)
+    line(0, 10)
+    line(10, 10)
+    line.clear()
+    assert s.text == ""
+
+
+def test_cli_shows_progress_only_on_a_terminal(tmp_path, pcm_file, monkeypatch, capsys):
+    out = tmp_path / "o.wav"
+    assert cli.main(["encode", str(pcm_file), "-o", str(out), "--quality", "fast"]) == 0
+    assert capsys.readouterr().err == ""              # pytest's stderr is not a terminal
+
+    fake = FakeStream(tty=True)
+    monkeypatch.setattr(cli.sys, "stderr", fake)
+    assert cli.main(["encode", str(pcm_file), "-o", str(out), "--quality", "fast"]) == 0
+    assert "in.wav: encoding 100%" in fake.text
+    assert fake.text.endswith("\r")                   # line wiped before the result is printed
+
+
+def test_progress_callback_is_smooth(monkeypatch):
+    """Many small steps, so a console shows more than a jump from 0% to 100%."""
+    seen = []
+    msadpcm.encode(helpers.voice(500 * 3000), block_align=256, quality="normal",
+                   progress=lambda d, t: seen.append(d))
+    assert len(seen) >= 8 and seen[0] == 0 and seen[-1] == 3000
+    assert all(b > a for a, b in zip(seen, seen[1:]))      # strictly increasing, never repeats
+
+
+def test_progress_is_smooth_within_a_single_chunk():
+    """Progress comes from inside the encoder loop, not only between chunks of blocks."""
+    seen = []
+    msadpcm.encode(helpers.voice(500 * 200), block_align=256, quality="normal",
+                   progress=lambda d, t: seen.append(d))      # 500 samples/block: 200 blocks, one chunk
+    assert len(seen) >= 20 and seen[-1] == 200
+
+
+def test_default_quality_is_normal():
+    x = helpers.voice(3000)
+    default = msadpcm.encode(x, block_align=256)
+    assert default == msadpcm.encode(x, block_align=256, quality="normal")
+    assert default != msadpcm.encode(x, block_align=256, quality="fast")
+    assert cli._build_parser().parse_args(["encode", "x.wav"]).quality == "normal"
