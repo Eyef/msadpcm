@@ -13,7 +13,7 @@ pcm = msadpcm.decode(blocks, channels=1, block_align=512, n_samples=len(tone))
 print("raw: %d -> %d bytes, SNR %.1f dB" % (tone.nbytes, len(blocks), msadpcm.snr_db(tone, pcm[:, 0])))
 
 # 2. A complete WAV file ----------------------------------------------------
-msadpcm.write_wav("tone_adpcm.wav", tone, rate, quality="high")   # block size like Windows ACM
+msadpcm.write_wav("tone_adpcm.wav", tone, rate, quality="high")   # slower, a bit better; default is "normal"
 pcm, rate_back = msadpcm.read_wav("tone_adpcm.wav")                # (frames, channels) int16
 print("wav: %d frames at %d Hz" % (len(pcm), rate_back))
 

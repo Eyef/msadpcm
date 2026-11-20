@@ -43,7 +43,7 @@ def main() -> None:
     src_var = tk.StringVar()
     dst_var = tk.StringVar()
     block_var = tk.StringVar(value="Auto (like Windows ACM)")
-    quality_var = tk.StringVar(value="high")
+    quality_var = tk.StringVar(value="normal")
     status_var = tk.StringVar(value="Choose a WAV file.")
 
     pad = dict(padx=8, pady=4)
