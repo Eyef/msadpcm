@@ -8,7 +8,7 @@ Python + NumPy. No external programs and no compiled extensions.
 * encoder searches all 7 standard predictors and a grid of initial step sizes for every block, with
   the same arithmetic as the decoder, so the quality it measures is the quality you get
 * reads and writes complete WAV files (`fact` chunk included), or works on raw blocks in memory
-* optional custom coefficient tables
+* optional custom coefficient tables (see the compatibility warning below)
 * command line tool and a small tkinter demo (`examples/gui_demo.py`)
 
 ```
@@ -121,6 +121,11 @@ Details worth knowing:
 * The header stores the initial delta as a signed 16-bit value; the encoder never writes more than 32767
   and avoids candidates whose delta would later exceed 32767, for decoders that keep it in 16 bits.
 * Only 1 or 2 channels exist in this format.
+* **Custom coefficient tables are not portable.** The format description allows extra coefficient pairs
+  in the `fmt ` chunk, and msadpcm reads and writes them (`coeffs=`), but FFmpeg's decoder does not
+  support them: it stops with an error on a predictor index of 7 or more, and silently decodes with the
+  standard table when the first seven pairs differ, giving wrong audio. Use `coeffs=` only if you control
+  the decoder as well. Microsoft's own codec is documented to accept extra pairs; that was not tested here.
 * To embed blocks in another container, use `encode()` for the raw blocks and `format_chunk()` for the
   standard `fmt ` chunk body.
 
