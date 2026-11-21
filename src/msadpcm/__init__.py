@@ -12,7 +12,7 @@ from .codec import (
 )
 from .wav import WavInfo, format_chunk, read_adpcm_raw, read_wav, wav_info, write_wav
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "ADAPTATION_TABLE",

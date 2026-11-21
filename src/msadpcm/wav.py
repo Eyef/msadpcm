@@ -130,20 +130,25 @@ def _parse(raw: bytes):
 
 
 def wav_info(path: PathLike) -> WavInfo:
-    """Read header information (and frame count) without decoding."""
+    """Read header information (and frame count) without decoding.
+
+    For MS ADPCM the frame count from the ``fact`` chunk is checked against what
+    the ``data`` chunk can actually hold: some tools write a ``fact`` value that
+    is too large (for stereo, twice the real length), and the smaller number
+    is the true one.
+    """
     raw = Path(path).read_bytes()
     info, (_, size) = _parse(raw)
-    if info.n_frames is None:
-        if info.is_adpcm:
-            ba = info.block_align
-            full, tail = divmod(size, ba)
-            n = full * codec.samples_per_block(ba, info.channels)
-            hdr = 7 * info.channels
-            if tail > hdr:
-                n += 2 + (tail - hdr) * 2 // info.channels
-            info.n_frames = n
-        elif info.block_align:
-            info.n_frames = size // info.block_align
+    if info.is_adpcm:
+        ba = info.block_align
+        full, tail = divmod(size, ba)
+        derived = full * codec.samples_per_block(ba, info.channels)
+        hdr = 7 * info.channels
+        if tail > hdr:
+            derived += 2 + (tail - hdr) * 2 // info.channels
+        info.n_frames = derived if info.n_frames is None else min(info.n_frames, derived)
+    elif info.block_align:
+        info.n_frames = size // info.block_align
     return info
 
 
