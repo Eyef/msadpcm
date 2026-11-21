@@ -474,7 +474,9 @@ def encode(
         ``"fast"``, ``"normal"`` (default), ``"high"`` or ``"max"``; slower presets
         try more candidates and gain a fraction of a dB (see :data:`QUALITY_LEVELS`).
     coeffs
-        Custom predictor table; default is the seven standard pairs.
+        Custom predictor table; default is the seven standard pairs.  Files made
+        with a different table are not portable: FFmpeg's decoder ignores or
+        rejects it (see the README), so use this only with your own decoder.
     progress
         Optional ``callback(done, total)`` called while encoding.
 

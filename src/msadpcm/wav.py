@@ -229,6 +229,9 @@ def write_wav(
 
     Returns the number of bytes written.  When no block size is given it uses
     :func:`msadpcm.default_block_align` for ``sample_rate``.
+
+    ``coeffs`` stores a custom coefficient table in the file; most decoders,
+    FFmpeg included, do not support that, so leave it unset for portable files.
     """
     frames = codec._as_frames(pcm, channels)
     n_frames, ch = frames.shape
