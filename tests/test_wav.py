@@ -157,3 +157,19 @@ def test_bad_files(tmp_path):
     msadpcm.write_wav(pcm, helpers.voice(100), 8000, adpcm=False)
     with pytest.raises(ValueError, match="not an MS ADPCM"):
         msadpcm.read_adpcm_raw(pcm)
+
+
+def test_oversized_fact_chunk_is_clamped(tmp_path):
+    """A stereo file whose ``fact`` says twice the real length (seen in files from other tools)."""
+    x = helpers.make_stereo(5000)
+    data = msadpcm.encode(x, samples_per_block=128)
+    real = len(data) // 140 * 128
+    p = tmp_path / "bad_fact.wav"
+    p.write_bytes(riff((b"fmt ", msadpcm.format_chunk(22050, 2, 140)),
+                       (b"fact", struct.pack("<I", 2 * real)), (b"data", data)))
+    assert msadpcm.wav_info(p).n_frames == real          # not 2 * real
+    assert len(msadpcm.read_wav(p)[0]) == real            # decoding was already unaffected
+    # a correct, smaller fact (padding in the last block) is still honoured
+    p.write_bytes(riff((b"fmt ", msadpcm.format_chunk(22050, 2, 140)),
+                       (b"fact", struct.pack("<I", 5000)), (b"data", data)))
+    assert msadpcm.wav_info(p).n_frames == 5000
