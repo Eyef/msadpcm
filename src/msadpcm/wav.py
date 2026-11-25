@@ -224,6 +224,7 @@ def write_wav(
     quality: str = "normal",
     coeffs: Optional[codec.Coeffs] = None,
     progress: Optional[Callable[[int, int], None]] = None,
+    workers: Optional[int] = 1,
 ) -> int:
     """Write ``pcm`` to ``path`` as MS ADPCM (or plain 16-bit PCM if ``adpcm=False``).
 
@@ -232,6 +233,7 @@ def write_wav(
 
     ``coeffs`` stores a custom coefficient table in the file; most decoders,
     FFmpeg included, do not support that, so leave it unset for portable files.
+    ``workers`` is the number of encoder processes (see :func:`msadpcm.encode`).
     """
     frames = codec._as_frames(pcm, channels)
     n_frames, ch = frames.shape
@@ -247,6 +249,7 @@ def write_wav(
         ba, _ = codec._resolve_geometry(ch, block_align, samples_per_block)
         data = codec.encode(
             frames, block_align=ba, quality=quality, coeffs=coeffs, progress=progress,
+            workers=workers,
         )
         chunks = [
             (b"fmt ", format_chunk(sample_rate, ch, ba, coeffs)),

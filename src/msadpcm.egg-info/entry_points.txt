@@ -1,0 +1,2 @@
+[console_scripts]
+msadpcm = msadpcm.cli:main

@@ -18,6 +18,8 @@ measures is what a decoder will output, bit for bit.
 """
 from __future__ import annotations
 
+import os
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from typing import Callable, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -178,36 +180,61 @@ def _as_frames(pcm, channels: Optional[int]) -> np.ndarray:
 # --------------------------------------------------------------------------
 # Quality presets
 # --------------------------------------------------------------------------
-#: ``n_pred``   - how many predictors are tried per block.  Ranking them by
-#:               open-loop error is unreliable (tonal material loses up to
-#:               5 dB), so every preset tries all of them.
-#: ``mults``    - initial deltas tried, as multiples of the per-block estimate
-#: ``refine``   - second pass: fine search around the winning delta
+# The initial delta of a block has a large and very irregular effect on its
+# error: the delta adapts after every sample, and over a few dozen samples the
+# result depends chaotically on where it started.  Measured on real recordings
+# with 128-sample blocks, the best delta among ~100 values spaced 3 % apart is
+# often several dB better than the best of a coarse grid, and the dense curve
+# has many narrow dips.  A finer search therefore pays off, but only for one
+# predictor: the predictors differ so much (a median of 10 to 30 dB on most
+# material) that a coarse pass picks the right one reliably.  So the search is
+#
+#   1. coarse:  every predictor x a few deltas around an estimate; keep the best ``keep``
+#               predictors,
+#   2. dense:   for those, every delta of a fixed ~3 %-spaced integer grid inside a
+#               window around the estimate (every ``step``-th grid point),
+#   3. polish:  deltas just next to the winner (only when ``step`` > 1),
+#   4. one last pass that records the nibbles of the winner.
+#
+#: ``n_pred``  - predictors entering the coarse stage (all seven standard ones; a
+#:               custom table with more pairs is pre-ranked by open-loop error)
+#: ``coarse``  - initial deltas of the coarse stage, as multiples of the estimate
+#:               (mean |open-loop residual| of the first 16 samples)
+#: ``keep``    - predictors that get the dense search (0: none, the coarse winner is used)
+#: ``step``    - dense grid stride; 1 means every point (spacing 3 %), 4 about 13 %
+#: ``window``  - dense search range, as multiples of the estimate
 def _grid(*parts) -> Tuple[float, ...]:
     return tuple(sorted({round(float(v), 4) for p in parts for v in p}))
 
 
-# Every preset's coarse search covers all candidates of the previous preset.
-# The refinement pass is centred on each preset's own winner, so the final
-# SNR is almost always, but not strictly always, ordered fast <= normal <= high.
-_FAST = (0.3, 0.7, 1.4)
-_NORMAL = _grid(_FAST, (0.2, 0.4, 1.0, 1.6))
-_HIGH = _grid(_NORMAL, (0.15, 0.25, 0.35, 0.5, 2.0, 3.0))
-_MAX = _grid(_HIGH, np.geomspace(0.05, 6.0, 28))
+_GRID_RATIO = 1.03
 
+
+def _make_delta_grid() -> np.ndarray:
+    k = np.arange(0, 400)
+    g = np.unique(np.rint(MIN_DELTA * _GRID_RATIO ** k).astype(np.int64))
+    return g[g <= MAX_HEADER_DELTA].astype(np.int32)
+
+
+#: Distinct integer deltas, spaced about 3 % apart (all integers up to 33).
+_DELTA_GRID = _make_delta_grid()
+
+_FAST = (0.3, 0.7, 1.4)
+_COARSE5 = (0.12, 0.22, 0.4, 0.7, 1.2)
+_COARSE7 = (0.09, 0.15, 0.25, 0.4, 0.65, 1.05, 1.7)
+
+# Roughly 21 / 67 / 140 / 330 candidate lanes per block for a 128-sample block.
 QUALITY_LEVELS = {
-    "fast": dict(n_pred=7, mults=_FAST, refine=False),
-    "normal": dict(n_pred=7, mults=_NORMAL, refine=True),
-    "high": dict(n_pred=7, mults=_HIGH, refine=True),
-    "max": dict(n_pred=7, mults=_MAX, refine=True),
+    "fast":   dict(n_pred=7, coarse=_FAST,    keep=0, step=0, window=(0.08, 1.6)),
+    "normal": dict(n_pred=7, coarse=_COARSE5, keep=1, step=4, window=(0.08, 1.6)),
+    "high":   dict(n_pred=7, coarse=_COARSE7, keep=1, step=1, window=(0.08, 1.6)),
+    "max":    dict(n_pred=7, coarse=_COARSE7, keep=2, step=1, window=(0.05, 2.0)),
 }
 
-_REFINE_MULTS = (0.8, 0.9, 1.1, 1.25)
-#: Rough number of candidate lanes processed per vectorised chunk.  Larger chunks
-#: amortise the per-chunk Python overhead; timings between 1 << 14 and 1 << 17 differ
-#: by less than run-to-run noise on the machines tested, so this is the value the
-#: 0.1.0 release was measured with.  Progress reporting does not depend on it.
-_LANES_PER_CHUNK = 1 << 17
+#: Rough number of candidate lanes processed per vectorised chunk.  Around 2**15 the
+#: working arrays stay in the CPU cache; 2**17 was about 20 % slower, and much smaller
+#: chunks lose to the per-call overhead of NumPy.  Progress reporting does not depend on it.
+_LANES_PER_CHUNK = 1 << 15
 #: Upper bound for ``rows * samples_per_block`` per chunk; keeps memory flat
 #: (roughly 120 MB) however large the blocks are.
 _ELEMS_PER_CHUNK = 1 << 22
@@ -223,35 +250,32 @@ def _trunc_div256(t: np.ndarray) -> np.ndarray:
 
 def _simulate(
     x: np.ndarray,
-    cand_pred: np.ndarray,
-    cand_delta: np.ndarray,
+    lane_row: np.ndarray,
+    lane_pred: np.ndarray,
+    lane_delta: np.ndarray,
     c1_tab: np.ndarray,
     c2_tab: np.ndarray,
     want_nibs: bool = False,
     tick: Optional[Callable[[float], None]] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Encode every row of ``x`` with every candidate.
+    """Encode block ``lane_row[k]`` with predictor ``lane_pred[k]`` and initial
+    delta ``lane_delta[k]``, for every lane ``k`` at once.
 
-    x          : (r, N) int32 samples
-    cand_pred  : (r, M) predictor index per candidate
-    cand_delta : (r, M) initial delta per candidate
-    want_nibs  : also return the nibbles; only worth it for a few candidates,
-                 the buffer is (N-2) * r * M bytes
-    tick       : optional ``callback(fraction_done)`` called every 32 samples
-    returns    : err (r, M) float64 squared error, nibbles (N-2, r*M) uint8 or None
+    x      : (r, N) int32 samples
+    want_nibs : also return the nibbles; only worth it for few lanes, the buffer
+                is (N-2) * lanes bytes
+    tick   : optional ``callback(fraction_done)`` called every 32 samples
+    returns: err (lanes,) float64 squared error, nibbles (N-2, lanes) uint8 or None
     """
-    r, n = x.shape
-    m = cand_pred.shape[1]
-    lanes = r * m
-    row = np.repeat(np.arange(r), m)
+    n = x.shape[1]
+    lanes = len(lane_row)
     xt = np.ascontiguousarray(x.T)  # (N, r)
 
-    flat_pred = cand_pred.reshape(-1)
-    c1 = c1_tab[flat_pred]
-    c2 = c2_tab[flat_pred]
-    s1 = xt[1][row].astype(np.int32)
-    s2 = xt[0][row].astype(np.int32)
-    delta = cand_delta.reshape(-1).astype(np.int32)
+    c1 = c1_tab[lane_pred]
+    c2 = c2_tab[lane_pred]
+    s1 = xt[1][lane_row].astype(np.int32)
+    s2 = xt[0][lane_row].astype(np.int32)
+    delta = np.asarray(lane_delta).astype(np.int32)
     err = np.zeros(lanes, dtype=np.float64)
     over = np.zeros(lanes, dtype=bool)
     nibs = np.empty((n - 2, lanes), dtype=np.uint8) if want_nibs else None
@@ -260,7 +284,7 @@ def _simulate(
         if tick is not None and not (i & 31):
             tick((i - 2) / (n - 2))
         pred = _trunc_div256(s1 * c1 + s2 * c2)
-        target = xt[i][row]
+        target = xt[i][lane_row]
         q = np.rint((target - pred) / delta)
         np.clip(q, -8, 7, out=q)
         q = q.astype(np.int32)
@@ -281,95 +305,175 @@ def _simulate(
     # Decoders that keep the delta in 16 bits would diverge once it exceeds
     # 32767; steer away from such candidates whenever an alternative exists.
     err += over * 1e18
-    return err.reshape(r, m), nibs
+    return err, nibs
+
+
+def _argmin_runs(err: np.ndarray, counts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-row minimum of ``err`` whose rows are consecutive runs of ``counts``
+    (all >= 1) lanes.  Returns (index of the first minimum, minimum)."""
+    starts = np.zeros(len(counts), dtype=np.int64)
+    np.cumsum(counts[:-1], out=starts[1:])
+    mins = np.minimum.reduceat(err, starts)
+    pos = np.flatnonzero(err == np.repeat(mins, counts))
+    row_of = np.repeat(np.arange(len(counts)), counts)[pos]
+    first = pos[np.searchsorted(row_of, np.arange(len(counts)))]
+    return first, mins
 
 
 def _search_rows(
     x: np.ndarray,
     c1_tab: np.ndarray,
     c2_tab: np.ndarray,
-    n_pred: int,
-    mults: Sequence[float],
-    refine: bool,
+    cfg: dict,
     tick: Optional[Callable[[float], None]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Find predictor, initial delta and nibbles for each row of ``x``.
 
-    ``tick(fraction)`` reports progress over the three simulation passes,
-    weighted by how many candidate lanes each one processes.
+    ``tick(fraction)`` reports progress over the simulation passes, weighted by
+    the number of candidate lanes each one processes (the dense pass's weight is
+    an estimate, so the fraction may jump a little when it ends).
     """
     r, n = x.shape
     n_coef = len(c1_tab)
-    n_pred = min(n_pred, n_coef)
+    n_pred = min(cfg["n_pred"], n_coef)
+    coarse = np.asarray(cfg["coarse"], dtype=np.float64)
+    keep = min(cfg["keep"], n_pred)
+    step = cfg["step"]
+    lo_w, hi_w = cfg["window"]
+    ar = np.arange(r)
 
-    # Open-loop residuals of every predictor (uses the true signal as history).
-    h1 = x[:, 1:-1]
-    h2 = x[:, :-2]
-    tgt = x[:, 2:]
-    res = np.empty((n_coef, r, n - 2), dtype=np.int32)
-    for p in range(n_coef):
-        res[p] = tgt - _trunc_div256(h1 * c1_tab[p] + h2 * c2_tab[p])
-    score = np.empty((n_coef, r), dtype=np.float64)
-    for p in range(n_coef):  # one predictor at a time: no (P, r, n) float64 temporary
-        rp = res[p].astype(np.float64)
-        score[p] = np.einsum("ij,ij->i", rp, rp)
-    order = np.argsort(score, axis=0)[:n_pred]  # (n_pred, r) best first
-    sel = order.T  # (r, n_pred)
+    # Which predictors enter the coarse stage.
+    if n_coef > n_pred:  # only for custom tables with many pairs
+        score = np.empty((n_coef, r), dtype=np.float64)
+        for p in range(n_coef):
+            rp = (x[:, 2:] - _trunc_div256(x[:, 1:-1] * c1_tab[p] + x[:, :-2] * c2_tab[p]))
+            rp = rp.astype(np.float64)
+            score[p] = np.einsum("ij,ij->i", rp, rp)
+        sel = np.argsort(score, axis=0)[:n_pred].T  # (r, n_pred) best first
+    else:
+        sel = np.broadcast_to(np.arange(n_coef), (r, n_coef))
 
-    # Initial-delta estimate: scale of the first few residuals of that predictor.
+    # Delta estimate per (row, predictor): scale of the first few open-loop residuals.
     head = min(16, n - 2)
-    rows_idx = np.arange(r)[:, None]
-    head_res = np.abs(res[:, :, :head]).astype(np.float64).mean(axis=2)  # (P, r)
-    est = head_res.T[rows_idx, sel]  # (r, n_pred)
+    est = np.empty((r, n_pred), dtype=np.float64)
+    for j in range(n_pred):
+        p = sel[:, j]
+        h = x[:, 2:2 + head] - _trunc_div256(
+            x[:, 1:1 + head] * c1_tab[p][:, None] + x[:, :head] * c2_tab[p][:, None])
+        est[:, j] = np.abs(h).astype(np.float64).mean(axis=1)
     est = np.maximum(est, MIN_DELTA)
 
-    mult = np.asarray(mults, dtype=np.float64)
-    cand_delta = np.rint(est[:, :, None] * mult[None, None, :])
-    cand_delta = np.clip(cand_delta, MIN_DELTA, MAX_HEADER_DELTA).astype(np.int32)
-    cand_pred = np.broadcast_to(sel[:, :, None], cand_delta.shape)
-    cand_delta = cand_delta.reshape(r, -1)
-    cand_pred = np.ascontiguousarray(cand_pred.reshape(r, -1))
+    # ---- stage 1: coarse ------------------------------------------------
+    m1 = len(coarse)
+    d1 = np.clip(np.rint(est[:, :, None] * coarse[None, None, :]), MIN_DELTA, MAX_HEADER_DELTA)
+    d1 = d1.astype(np.int32).reshape(r, -1)
+    p1 = np.repeat(sel, m1, axis=1)  # (r, n_pred * m1)
+    lanes1 = n_pred * m1
 
-    w_main, w_ref = cand_pred.shape[1], (len(_REFINE_MULTS) if refine else 0)
-    w_all = float(w_main + w_ref + 1)
+    # Dense-stage size, known from the estimates alone (upper bound for the weights).
+    dense = keep > 0 and step > 0
+    if dense:
+        lo_i = np.searchsorted(_DELTA_GRID, est * lo_w, side="left")
+        hi_i = np.searchsorted(_DELTA_GRID, est * hi_w, side="right") - 1
+        hi_i = np.maximum(hi_i, lo_i)
+        hi_i = np.minimum(hi_i, len(_DELTA_GRID) - 1)
+        lo_i = np.minimum(lo_i, hi_i)
+        cnt_all = (hi_i - lo_i) // step + 1  # (r, n_pred)
+        w_dense = keep * float(cnt_all.mean())
+    else:
+        w_dense = 0.0
+    w_pol = 2.0 * (step - 1) if dense and step > 1 else 0.0
+    w_all = lanes1 + w_dense + w_pol + 1.0
 
-    def stage(lo_w: float, hi_w: float):
+    def stage(lo: float, hi: float):
         if tick is None:
             return None
-        return lambda f: tick((lo_w + f * (hi_w - lo_w)) / w_all)
+        return lambda f: tick((lo + f * (hi - lo)) / w_all)
 
-    err, _ = _simulate(x, cand_pred, cand_delta, c1_tab, c2_tab, tick=stage(0, w_main))
-    ar = np.arange(r)
-    best = err.argmin(axis=1)
-    best_pred = cand_pred[ar, best]
-    best_delta = cand_delta[ar, best]
-    best_err = err[ar, best]
+    err1, _ = _simulate(
+        x, np.repeat(ar, lanes1), p1.reshape(-1), d1.reshape(-1), c1_tab, c2_tab,
+        tick=stage(0, lanes1))
+    err1 = err1.reshape(r, n_pred, m1)
+    k1 = err1.argmin(axis=2)  # (r, n_pred)
+    e1 = np.take_along_axis(err1, k1[:, :, None], axis=2)[:, :, 0]
+    dd1 = np.take_along_axis(d1.reshape(r, n_pred, m1), k1[:, :, None], axis=2)[:, :, 0]
+    order = np.argsort(e1, axis=1)  # (r, n_pred) best first
+    top = order[:, 0]
+    best_pred = sel[ar, top]
+    best_delta = dd1[ar, top]
+    best_err = e1[ar, top]
 
-    if refine:
-        rm = np.asarray(_REFINE_MULTS, dtype=np.float64)
-        rdelta = np.rint(best_delta[:, None] * rm[None, :])
-        rdelta = np.clip(rdelta, MIN_DELTA, MAX_HEADER_DELTA).astype(np.int32)
-        rpred = np.broadcast_to(best_pred[:, None], rdelta.shape).copy()
-        err2, _ = _simulate(x, rpred, rdelta, c1_tab, c2_tab, tick=stage(w_main, w_main + w_ref))
-        b2 = err2.argmin(axis=1)
-        e2 = err2[ar, b2]
-        better = e2 < best_err
-        best_delta = np.where(better, rdelta[ar, b2], best_delta)
-        best_err = np.where(better, e2, best_err)
+    # ---- stage 2: dense -------------------------------------------------
+    if dense:
+        cols = order[:, :keep]  # (r, keep)
+        lo_k = np.take_along_axis(lo_i, cols, axis=1)
+        cnt_k = np.take_along_axis(cnt_all, cols, axis=1)
+        pred_k = np.take_along_axis(sel, cols, axis=1)
+        counts = cnt_k.reshape(-1)  # runs: (row, kept predictor), row-major
+        total = int(counts.sum())
+        run_start = np.zeros(len(counts), dtype=np.int64)
+        np.cumsum(counts[:-1], out=run_start[1:])
+        within = np.arange(total) - np.repeat(run_start, counts)
+        gidx = np.repeat(lo_k.reshape(-1), counts) + step * within
+        lane_delta = _DELTA_GRID[np.minimum(gidx, len(_DELTA_GRID) - 1)]
+        lane_pred = np.repeat(pred_k.reshape(-1), counts)
+        lane_row = np.repeat(np.repeat(ar, keep), counts)
+        err2, _ = _simulate(
+            x, lane_row, lane_pred, lane_delta, c1_tab, c2_tab, tick=stage(lanes1, lanes1 + w_dense))
+        row_counts = cnt_k.sum(axis=1)
+        first, mins = _argmin_runs(err2, row_counts)
+        better = mins < best_err
+        best_pred = np.where(better, lane_pred[first], best_pred)
+        best_delta = np.where(better, lane_delta[first], best_delta)
+        best_err = np.where(better, mins, best_err)
+
+        # ---- stage 3: polish, a few deltas next to the winner ----------
+        if step > 1:
+            j = np.concatenate([np.arange(-(step - 1), 0), np.arange(1, step)])
+            pd = np.rint(best_delta[:, None] * _GRID_RATIO ** j[None, :])
+            pd = np.clip(pd, MIN_DELTA, MAX_HEADER_DELTA).astype(np.int32)
+            m3 = pd.shape[1]
+            err3, _ = _simulate(
+                x, np.repeat(ar, m3), np.repeat(best_pred, m3), pd.reshape(-1), c1_tab, c2_tab,
+                tick=stage(lanes1 + w_dense, lanes1 + w_dense + w_pol))
+            err3 = err3.reshape(r, m3)
+            b3 = err3.argmin(axis=1)
+            e3 = err3[ar, b3]
+            better = e3 < best_err
+            best_delta = np.where(better, pd[ar, b3], best_delta)
+            best_err = np.where(better, e3, best_err)
 
     # Only the winners need their nibbles: one extra pass over r lanes.
     final_err, best_nibs = _simulate(
-        x, best_pred[:, None], best_delta[:, None].astype(np.int32), c1_tab, c2_tab,
-        want_nibs=True, tick=stage(w_main + w_ref, w_all))
-    best_err = final_err[:, 0]
-    best_nibs = best_nibs.T  # (r, N-2)
-
+        x, ar, best_pred, best_delta, c1_tab, c2_tab, want_nibs=True,
+        tick=stage(w_all - 1.0, w_all))
     return (
         best_pred.astype(np.uint8),
         best_delta.astype(np.int32),
-        np.ascontiguousarray(best_nibs, dtype=np.uint8),
-        best_err,
+        np.ascontiguousarray(best_nibs.T, dtype=np.uint8),
+        final_err,
     )
+
+
+def _search_chunk(args):
+    """Worker entry point (module level so that it can be pickled)."""
+    x, c1_tab, c2_tab, cfg = args
+    return _search_rows(x, c1_tab, c2_tab, cfg)
+
+
+def _resolve_workers(workers: Optional[int]) -> int:
+    if workers is None or workers == 0:
+        return os.cpu_count() or 1
+    if workers < 0 or int(workers) != workers:
+        raise ValueError("workers must be a positive integer, or 0 for all CPUs")
+    return int(workers)
+
+
+#: Fewest rows worth sending to a worker process in one piece.
+_MIN_ROWS_PER_TASK = 64
+#: Below this much work (samples x candidate lanes, roughly 0.8 s of single-process
+#: time) starting worker processes costs more than it saves.
+_MIN_PARALLEL_WORK = 5e7
 
 
 def _encode_rows(
@@ -377,17 +481,35 @@ def _encode_rows(
     coeffs: Optional[Coeffs],
     quality: str,
     progress: Optional[ProgressFn],
+    workers: Optional[int] = 1,
 ):
-    """Encode (R, N) int16 rows. Returns preds, deltas, nibbles, errors."""
+    """Encode (R, N) int16 rows. Returns preds, deltas, nibbles, errors.
+
+    Every row is decided on its own, so the result does not depend on how the
+    rows are split into chunks or on ``workers``.
+    """
     if quality not in QUALITY_LEVELS:
         raise ValueError("quality must be one of %s" % ", ".join(QUALITY_LEVELS))
+    workers = _resolve_workers(workers)
     cfg = QUALITY_LEVELS[quality]
     c1_tab, c2_tab = _coeff_arrays(coeffs)
     total, n = rows.shape
     x = rows.astype(np.int32)
 
-    per_row = max(1, min(cfg["n_pred"], len(c1_tab)) * len(cfg["mults"]))
-    step = max(1, min(_LANES_PER_CHUNK // per_row, _ELEMS_PER_CHUNK // n))
+    n_pred = min(cfg["n_pred"], len(c1_tab))
+    per_row = n_pred * len(cfg["coarse"])
+    if cfg["keep"] > 0 and cfg["step"] > 0:
+        # dense stage upper bound: the whole window of the grid, every ``step``-th point
+        span = np.log(cfg["window"][1] / cfg["window"][0]) / np.log(_GRID_RATIO)
+        per_row = max(per_row, cfg["keep"] * int(span / cfg["step"] + 2))
+    step = max(1, min(_LANES_PER_CHUNK // max(1, per_row), _ELEMS_PER_CHUNK // n))
+    if total * n * per_row < _MIN_PARALLEL_WORK:
+        workers = 1  # decided first: the smaller chunks below are only good for workers
+    if workers > 1:  # several chunks per worker keep all of them busy until the end
+        step = max(min(step, _MIN_ROWS_PER_TASK), min(step, -(-total // (workers * 4))))
+    spans = [(lo, min(total, lo + step)) for lo in range(0, total, step)]
+    if len(spans) < 2:
+        workers = 1
 
     preds = np.empty(total, dtype=np.uint8)
     deltas = np.empty(total, dtype=np.int32)
@@ -401,15 +523,41 @@ def _encode_rows(
             last = done
             progress(done, total)
 
+    def store(lo, hi, res):
+        preds[lo:hi], deltas[lo:hi], nibs[lo:hi], errs[lo:hi] = res
+
     report(0)
-    for lo in range(0, total, step):
-        hi = min(total, lo + step)
-        tick = (lambda f, lo=lo, hi=hi: report(lo + int(f * (hi - lo)))) if progress else None
-        p, d, nb, e = _search_rows(
-            x[lo:hi], c1_tab, c2_tab, cfg["n_pred"], cfg["mults"], cfg["refine"], tick
-        )
-        preds[lo:hi], deltas[lo:hi], nibs[lo:hi], errs[lo:hi] = p, d, nb, e
-        report(hi)
+    if workers == 1:
+        for lo, hi in spans:
+            tick = (lambda f, lo=lo, hi=hi: report(lo + int(f * (hi - lo)))) if progress else None
+            store(lo, hi, _search_rows(x[lo:hi], c1_tab, c2_tab, cfg, tick))
+            report(hi)
+        return preds, deltas, nibs, errs
+
+    done_rows = 0
+    pending = {}
+    queue = iter(spans)
+    ex = ProcessPoolExecutor(max_workers=workers)
+    try:
+        while True:
+            while len(pending) < 2 * workers:  # bounded: only a few chunks are pickled at a time
+                span = next(queue, None)
+                if span is None:
+                    break
+                lo, hi = span
+                pending[ex.submit(_search_chunk, (x[lo:hi], c1_tab, c2_tab, cfg))] = span
+            if not pending:
+                break
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                lo, hi = pending.pop(fut)
+                store(lo, hi, fut.result())
+                done_rows += hi - lo
+                report(done_rows)
+    except BaseException:
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown()
     return preds, deltas, nibs, errs
 
 
@@ -456,6 +604,7 @@ def encode(
     quality: str = "normal",
     coeffs: Optional[Coeffs] = None,
     progress: Optional[ProgressFn] = None,
+    workers: Optional[int] = 1,
 ) -> bytes:
     """Encode PCM to raw MS ADPCM blocks.
 
@@ -479,6 +628,13 @@ def encode(
         rejects it (see the README), so use this only with your own decoder.
     progress
         Optional ``callback(done, total)`` called while encoding.
+    workers
+        Number of worker processes (default 1: everything runs in the calling
+        process).  ``0`` means one per CPU.  The output is byte-for-byte the same
+        for any value.  Small inputs (about a second of work) are encoded in the
+        calling process regardless, since starting workers would cost more; on
+        Windows and macOS the workers are started with *spawn*, so a script that
+        calls this must be guarded by ``if __name__ == "__main__":``.
 
     Returns
     -------
@@ -501,7 +657,7 @@ def encode(
     rows = frames.reshape(blocks, n, ch).transpose(2, 0, 1).reshape(ch * blocks, n)
     rows = np.ascontiguousarray(rows)
 
-    preds, deltas, nibs, _ = _encode_rows(rows, coeffs, quality, progress)
+    preds, deltas, nibs, _ = _encode_rows(rows, coeffs, quality, progress, workers)
     return _pack_blocks(rows.astype(np.int32), preds, deltas, nibs, ch, block_align)
 
 

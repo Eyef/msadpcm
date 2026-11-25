@@ -126,8 +126,8 @@ def test_quality_levels_are_ordered():
     for q in codec.QUALITY_LEVELS:
         d = msadpcm.decode(msadpcm.encode(x, block_align=256, quality=q), channels=1, block_align=256)
         snr[q] = msadpcm.snr_db(x, d[:len(x), 0])
-    # Refinement is centred on each preset's own winner, so neighbouring presets
-    # may differ by a few hundredths of a dB the "wrong" way; the trend must hold.
+    # The presets search different candidate sets, so neighbours may differ by a
+    # few hundredths of a dB the "wrong" way; the trend must hold.
     assert snr["fast"] <= snr["normal"] + 0.25
     assert snr["normal"] <= snr["high"] + 0.25
     assert snr["high"] <= snr["max"] + 0.25
@@ -154,6 +154,83 @@ def test_many_chunks_give_same_result(monkeypatch):
     whole = msadpcm.encode(x, samples_per_block=128, quality="normal")
     monkeypatch.setattr(codec, "_LANES_PER_CHUNK", 64)
     assert msadpcm.encode(x, samples_per_block=128, quality="normal") == whole
+
+
+def test_dense_search_beats_coarse_search_on_small_blocks():
+    """With 128-sample blocks the fine delta search is worth several dB."""
+    x = helpers.voice(128 * 200)
+    snr = {}
+    for q in ("fast", "normal", "high"):
+        d = msadpcm.decode(msadpcm.encode(x, samples_per_block=128, quality=q),
+                           channels=1, block_align=70)
+        snr[q] = msadpcm.snr_db(x, d[:len(x), 0])
+    assert snr["normal"] > snr["fast"] + 1.0
+    assert snr["high"] > snr["normal"] + 0.2
+
+
+def test_argmin_runs():
+    err = np.array([5.0, 3.0, 3.0, 9.0, 1.0, 2.0, 7.0])
+    counts = np.array([3, 1, 3])
+    first, mins = codec._argmin_runs(err, counts)
+    assert list(first) == [1, 3, 4] and list(mins) == [3.0, 9.0, 1.0]
+
+
+def test_custom_table_with_many_pairs_preselects_predictors():
+    table = list(msadpcm.STANDARD_COEFFS) + [(300, -40), (100, 100), (400, -100), (50, 50)]
+    x = helpers.music(128 * 30)
+    for q in ("fast", "high"):
+        data = msadpcm.encode(x, samples_per_block=128, quality=q, coeffs=table)
+        dec = msadpcm.decode(data, channels=1, block_align=70, coeffs=table)
+        assert msadpcm.snr_db(x, dec[:len(x), 0]) > 30
+
+
+# --------------------------------------------------------------------------
+# parallel encoding
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("channels,quality", [(1, "normal"), (2, "high"), (1, "fast")])
+def test_workers_give_identical_output(monkeypatch, channels, quality):
+    x = helpers.make_stereo(128 * 90)[:, :channels]
+    serial = msadpcm.encode(x, samples_per_block=128, quality=quality)
+    monkeypatch.setattr(codec, "_MIN_ROWS_PER_TASK", 4)
+    monkeypatch.setattr(codec, "_MIN_PARALLEL_WORK", 0)    # force several tasks on a small input
+    monkeypatch.setattr(codec, "_LANES_PER_CHUNK", 600)
+    assert msadpcm.encode(x, samples_per_block=128, quality=quality, workers=2) == serial
+
+
+def test_workers_progress_is_monotonic_and_complete(monkeypatch):
+    monkeypatch.setattr(codec, "_MIN_ROWS_PER_TASK", 4)
+    monkeypatch.setattr(codec, "_MIN_PARALLEL_WORK", 0)
+    monkeypatch.setattr(codec, "_LANES_PER_CHUNK", 600)
+    calls = []
+    msadpcm.encode(helpers.voice(128 * 60), samples_per_block=128, quality="fast", workers=2,
+                   progress=lambda d, t: calls.append((d, t)))
+    done = [c[0] for c in calls]
+    assert done == sorted(done) and calls[0][0] == 0 and calls[-1] == (60, 60)
+
+
+def test_small_jobs_do_not_start_workers(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("a process pool was created for a tiny job")
+    monkeypatch.setattr(codec, "ProcessPoolExecutor", boom)
+    x = helpers.voice(128 * 300)
+    assert msadpcm.encode(x, samples_per_block=128, workers=4) == msadpcm.encode(x, samples_per_block=128)
+    # ... and they keep the full-size chunks, which are much faster than the small ones
+    seen = []
+    orig = codec._search_rows
+    monkeypatch.setattr(codec, "_search_rows", lambda x, *a, **k: seen.append(len(x)) or orig(x, *a, **k))
+    msadpcm.encode(x, samples_per_block=128, workers=4)
+    assert max(seen) > 100
+
+
+def test_workers_zero_means_all_cpus_and_small_input_stays_serial():
+    x = helpers.voice(128 * 3)
+    assert msadpcm.encode(x, samples_per_block=128, workers=0) == msadpcm.encode(x, samples_per_block=128)
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5])
+def test_invalid_workers(bad):
+    with pytest.raises(ValueError, match="workers"):
+        msadpcm.encode(helpers.voice(500), workers=bad)
 
 
 # --------------------------------------------------------------------------

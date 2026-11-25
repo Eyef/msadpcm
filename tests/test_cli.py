@@ -145,3 +145,11 @@ def test_default_quality_is_normal():
     assert default == msadpcm.encode(x, block_align=256, quality="normal")
     assert default != msadpcm.encode(x, block_align=256, quality="fast")
     assert cli._build_parser().parse_args(["encode", "x.wav"]).quality == "normal"
+
+
+def test_cli_workers_option(tmp_path, pcm_file):
+    a, b = tmp_path / "a.wav", tmp_path / "b.wav"
+    assert cli.main(["encode", str(pcm_file), "-o", str(a), "--quality", "fast", "--no-verify"]) == 0
+    assert cli.main(["encode", str(pcm_file), "-o", str(b), "--quality", "fast", "--no-verify",
+                     "-j", "2"]) == 0
+    assert a.read_bytes() == b.read_bytes()

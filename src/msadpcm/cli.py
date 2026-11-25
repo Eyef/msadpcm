@@ -45,6 +45,7 @@ def convert_file(
     quality: str = "normal",
     verify: bool = True,
     progress: Optional[Callable[[int, int], None]] = None,
+    workers: Optional[int] = 1,
 ) -> ConversionResult:
     """Convert one WAV file.
 
@@ -70,7 +71,8 @@ def convert_file(
     if block_align is None and samples_per_block is None:
         block_align = codec.default_block_align(rate, ch)
     ba, spb = codec._resolve_geometry(ch, block_align, samples_per_block)
-    written = wav.write_wav(dst, pcm, rate, block_align=ba, quality=quality, progress=progress)
+    written = wav.write_wav(dst, pcm, rate, block_align=ba, quality=quality, progress=progress,
+                           workers=workers)
     snr = None
     if verify:
         decoded, _ = wav.read_wav(dst)
@@ -159,6 +161,8 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--block-align", type=int, help="bytes per block (default: like Windows ACM)")
     g.add_argument("--samples-per-block", type=int, help="sample frames per block, e.g. 128")
     enc.add_argument("--quality", choices=list(codec.QUALITY_LEVELS), default="normal")
+    enc.add_argument("-j", "--workers", type=int, default=1, metavar="N",
+                     help="encoder processes (default 1; 0 = one per CPU)")
     enc.add_argument("-o", "--output")
     enc.add_argument("-d", "--outdir")
     enc.add_argument("--no-verify", action="store_true", help="skip the SNR check")
@@ -203,7 +207,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 kwargs = dict(block_align=args.block_align,
                               samples_per_block=args.samples_per_block,
                               quality=args.quality, verify=not args.no_verify,
-                              progress=line)
+                              progress=line, workers=args.workers)
             try:
                 result = convert_file(src, dst, mode=args.cmd, **kwargs)
             finally:
