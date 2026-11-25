@@ -1,12 +1,15 @@
 # msadpcm
 
+[![tests](https://github.com/Eyef/msadpcm/actions/workflows/tests.yml/badge.svg)](https://github.com/Eyef/msadpcm/actions/workflows/tests.yml)
+
 Microsoft ADPCM (`WAVE_FORMAT_ADPCM`, tag `0x0002`) **encoder and decoder** in pure
 Python + NumPy. No external programs and no compiled extensions.
 
 * any block size (`block_align` in bytes, or `samples_per_block`), mono and stereo
 * decoder output is **bit-exact with FFmpeg's `adpcm_ms`** (checked in the test suite, both directions)
-* encoder searches all 7 standard predictors and a grid of initial step sizes for every block, with
+* encoder searches the 7 standard predictors and a fine grid of initial step sizes for every block, with
   the same arithmetic as the decoder, so the quality it measures is the quality you get
+* optional multi-process encoding (`workers=`), with byte-for-byte the same output
 * reads and writes complete WAV files (`fact` chunk included), or works on raw blocks in memory
 * optional custom coefficient tables (see the compatibility warning below)
 * command line tool and a small tkinter demo (`examples/gui_demo.py`)
@@ -51,18 +54,25 @@ expect (for example Doom 3 BFG Edition); any other geometry works the same way.
 
 ### Quality presets
 
-`quality="fast" | "normal" (default) | "high" | "max"`: how many candidate step sizes are tried per
-block (all presets try all seven predictors). The slower presets run a finer search.
+`quality="fast" | "normal" (default) | "high" | "max"`. For every block the encoder chooses a predictor
+and an initial step size (`delta`), and the step size matters a lot, especially in small blocks: after a
+few dozen samples the adapted step depends on where it started in a very irregular way, so
+neighbouring start values can differ by several dB. The search therefore has two stages: a coarse
+pass over all seven predictors with a few step sizes each picks the best predictor, then a dense
+grid of step sizes (3 % apart) is tried for that one. The presets differ in how dense that grid is:
+`fast` has no dense stage, `normal` tries every fourth grid point, `high` every point, and `max`
+every point for the two best predictors.
 
-How much that matters depends on the block size. With blocks of 512 to 1024 bytes `normal`, `high` and
-`max` are within 0.4 dB of each other (`fast` is up to 0.9 dB below `max`). With very small blocks (for
-example 128 samples) the initial step size has far more influence: `high` gains about 1 to 1.5 dB over
-`normal` and `max` 3 to 4 dB (see the tables below), so prefer them there.
+How much that matters depends on the block size. With 128-sample blocks `normal` gains 5 to 8 dB
+over `fast`, `high` another 2.5 to 5.5 dB, and `max` another 0.7 to 1.1 dB (tables below). With blocks of
+500 to 1000 samples all presets from `normal` up are within 0.3 dB of each other, so `normal` is the
+sensible choice there.
 
 ### Command line
 
 ```
 python -m msadpcm encode in.wav -o out.wav --samples-per-block 128 --quality normal
+python -m msadpcm encode *.wav -d out_dir --quality high -j 0          # all CPU cores
 python -m msadpcm decode out.wav -o back.wav
 python -m msadpcm info *.wav
 ```
@@ -78,32 +88,39 @@ Measured on four real recordings (not included in the repository), all 22.05 kHz
 generation). SNR in dB between the original and the decoded result, higher is better. Every file was
 decoded with msadpcm's own decoder, which is bit-exact with FFmpeg's, so only the encoders differ.
 
-**Blocks of 512 bytes (mono) / 1024 bytes (stereo)**, 1012 samples per block, compared with FFmpeg 6.1's
-`adpcm_ms` (SNR, dB):
-
+**Default block size** (`256 * channels` bytes at 22 kHz: 512 bytes, which is 1012 samples per block
+for mono and 500 for stereo), compared with FFmpeg 6.1's `adpcm_ms`:
 
 | recording | ffmpeg | fast | normal | high | max |
 |---|---|---|---|---|---|
-| speech | 24.73 | 29.07 | 29.43 | 29.52 | 29.65 |
-| sound effect | 31.03 | 32.22 | 32.62 | 32.78 | 32.95 |
-| music | 22.23 | 25.34 | 25.68 | 25.75 | 25.90 |
-| speech with effects (stereo) | 20.82 | 28.72 | 29.25 | 29.37 | 29.64 |
+| speech | 24.73 | 29.07 | 29.65 | 29.79 | 29.80 |
+| sound effect | 31.03 | 32.22 | 32.78 | 32.79 | 32.89 |
+| music | 22.23 | 25.34 | 25.90 | 26.04 | 26.06 |
+| speech with effects (stereo) | 20.82 | 28.72 | 29.65 | 29.84 | 29.87 |
 
 **Blocks of 128 samples** (70 bytes mono / 140 bytes stereo; FFmpeg only accepts power-of-two block
 sizes, so it is not in this table):
 
 | recording | fast | normal | high | max |
 |---|---|---|---|---|
-| speech | 32.13 | 35.05 | 36.20 | 38.24 |
-| sound effect | 35.52 | 38.49 | 39.49 | 41.29 |
-| music | 28.91 | 32.53 | 33.96 | 36.45 |
-| speech with effects (stereo) | 31.43 | 34.66 | 36.07 | 38.48 |
+| speech | 32.13 | 37.69 | 40.18 | 41.28 |
+| sound effect | 35.52 | 40.66 | 46.02 | 46.69 |
+| music | 28.91 | 37.18 | 41.09 | 41.76 |
+| speech with effects (stereo) | 31.43 | 38.94 | 41.89 | 42.80 |
 
-The gain of `normal` over FFmpeg's encoder depends on the material: about 1.6 dB on the short sound
-effect and 8 dB on the stereo recording. On the synthetic signals of `benchmarks/compare_ffmpeg.py`
-(anyone can run it) it ranges from about 2 to 9 dB. `msadpcm encode` prints the SNR of every file it
-writes, so you can measure your own material.
+(Version 0.1.2 reached 32.5 to 38.5 dB with `normal` and 36.5 to 41.3 dB with `max` on the same files;
+see the [changelog](CHANGELOG.md).)
 
+The gain of `normal` over FFmpeg's encoder at the default block size depends on the material: about
+1.7 dB on the short sound effect and 8.8 dB on the stereo recording. On the synthetic signals of
+`benchmarks/compare_ffmpeg.py` (anyone can run it) it ranges from about 2 to 9 dB. `msadpcm encode`
+prints the SNR of every file it writes, so you can measure your own material.
+
+**Several cores.** `workers=2` (or `-j 2`) took 5.3 s instead of 10 s for `max` on the 168 s music file,
+2.2 s instead of 4.7 s for `high`, and 1.3 s instead of 2.0 s for `normal` with 512-byte blocks, on two
+cores. Each worker process starts Python and NumPy, which costs a fraction of a second, so it only
+pays for files that take several seconds to encode; smaller jobs are encoded in the calling process
+automatically. On an i7-3770 with `-j 4`, a 6-minute mono file with 1024-byte blocks took 12.9 s instead of 32.3 s.
 
 ## How MS ADPCM blocks work
 
@@ -133,16 +150,21 @@ Details worth knowing:
 
 | | |
 |---|---|
-| `encode(pcm, *, channels=None, block_align=None, samples_per_block=None, quality="normal", coeffs=None, progress=None) -> bytes` | raw blocks |
+| `encode(pcm, *, channels=None, block_align=None, samples_per_block=None, quality="normal", coeffs=None, progress=None, workers=1) -> bytes` | raw blocks |
 | `decode(data, *, channels, block_align, n_samples=None, coeffs=None) -> int16[frames, channels]` | raw blocks |
-| `write_wav(path, pcm, rate, *, adpcm=True, block_align=None, samples_per_block=None, quality="normal", coeffs=None, progress=None)` | `adpcm=False` writes 16-bit PCM |
+| `write_wav(path, pcm, rate, *, adpcm=True, block_align=None, samples_per_block=None, quality="normal", coeffs=None, progress=None, workers=1)` | `adpcm=False` writes 16-bit PCM |
 | `read_wav(path) -> (int16[frames, channels], rate)` | PCM 8/16/24/32, float, extensible, MS ADPCM |
 | `wav_info(path) -> WavInfo`, `read_adpcm_raw(path)` | header / undecoded blocks |
 | `format_chunk(rate, channels, block_align, coeffs=None)` | `fmt ` chunk body |
 | `samples_per_block`, `block_align_for`, `default_block_align`, `snr_db` | helpers |
 
 `progress` is `callback(done_blocks, total_blocks)`; encoding is vectorised over all blocks, so the
-callback fires once per processed chunk of blocks (a few hundred blocks), not per block.
+callback fires while a chunk of blocks is processed (every few dozen samples of it), not per block.
+With `workers > 1` it fires when a chunk of blocks has been finished by a worker.
+
+`workers` is the number of encoder processes (default 1, `0` = one per CPU). The result is identical for
+any value. On Windows and macOS the workers are started by *spawn*, so a script that passes `workers`
+greater than 1 must keep its entry point under `if __name__ == "__main__":`.
 
 ## Development
 
@@ -153,6 +175,7 @@ python benchmarks/compare_ffmpeg.py
 ```
 
 The ffmpeg interoperability tests are skipped automatically when `ffmpeg` is not installed. The decoder is
-also tested against an independent scalar re-implementation (`tests/helpers.py`).
+also tested against an independent scalar re-implementation (`tests/helpers.py`). GitHub Actions runs the
+tests on Windows, Linux and macOS with Python 3.9 to 3.13 (`.github/workflows/tests.yml`).
 
 MIT licensed.
